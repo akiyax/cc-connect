@@ -452,10 +452,6 @@ func weixinPollQRStatus(ctx context.Context, apiBase, qrKey, routeTag string, de
 	return &out, nil
 }
 
-type netError interface {
-	Timeout() bool
-}
-
 func verifyWeixinToken(ctx context.Context, apiBase, token, routeTag string, debug bool) error {
 	base := strings.TrimRight(apiBase, "/") + "/"
 	u := strings.TrimRight(base, "/") + "/ilink/bot/getupdates"
