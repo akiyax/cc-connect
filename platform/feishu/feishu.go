@@ -134,6 +134,7 @@ type Platform struct {
 	cancel           context.CancelFunc
 	dedup            core.MessageDedup
 	botOpenID        string
+	botName          string
 	userNameCache    sync.Map // open_id -> display name
 	chatNameCache    sync.Map // chat_id -> chat name
 	// Webhook mode fields (for Lark international version)
@@ -274,11 +275,12 @@ func (p *Platform) KeepPreviewOnFinish() bool {
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 
-	if openID, err := p.fetchBotOpenID(); err != nil {
-		slog.Warn(p.platformName+": failed to get bot open_id, group chat filtering disabled", "error", err)
+	if openID, name, err := p.fetchBotInfo(); err != nil {
+		slog.Warn(p.platformName+": failed to get bot info, group chat filtering disabled", "error", err)
 	} else {
 		p.botOpenID = openID
-		slog.Info(p.platformName+": bot identified", "open_id", openID)
+		p.botName = name
+		slog.Info(p.platformName+": bot identified", "open_id", openID, "name", name)
 	}
 
 	p.eventHandler = dispatcher.NewEventDispatcher("", p.encryptKey).
@@ -335,8 +337,28 @@ func (p *Platform) startWebSocketMode() error {
 	p.cancel = cancel
 
 	go func() {
-		if err := p.wsClient.Start(ctx); err != nil {
-			slog.Error(p.tag()+": websocket error", "error", err)
+		for {
+			if err := p.wsClient.Start(ctx); err != nil {
+				slog.Error(p.tag()+": websocket error, will reconnect in 5s", "error", err)
+			} else {
+				slog.Warn(p.tag() + ": websocket exited cleanly, will reconnect in 5s")
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			// Recreate ws client for a fresh connection.
+			wsOpts := []larkws.ClientOption{
+				larkws.WithEventHandler(p.eventHandler),
+				larkws.WithLogLevel(larkcore.LogLevelInfo),
+				larkws.WithLogger(&sanitizingLogger{inner: larkcore.NewEventLogger()}),
+			}
+			if p.domain != lark.FeishuBaseUrl {
+				wsOpts = append(wsOpts, larkws.WithDomain(p.domain))
+			}
+			p.wsClient = larkws.NewClient(p.appID, p.appSecret, wsOpts...)
+			slog.Info(p.tag() + ": reconnecting websocket...")
 		}
 	}()
 
@@ -1705,7 +1727,7 @@ func detectMimeType(data []byte) string {
 }
 
 func buildReplyContent(content string) (msgType string, body string) {
-	if !containsMarkdown(content) {
+	if !containsMarkdown(content) && !strings.Contains(content, "<at ") {
 		b, _ := json.Marshal(map[string]string{"text": content})
 		return larkim.MsgTypeText, string(b)
 	}
@@ -1883,6 +1905,22 @@ func isValidFeishuHref(u string) bool {
 	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 }
 
+// extractAttrValue extracts the value of an attribute from an HTML-like tag.
+// e.g. extractAttrValue(`<at user_id="ou_123">`, "user_id") returns "ou_123".
+func extractAttrValue(tag, attr string) string {
+	key := attr + `="`
+	idx := strings.Index(tag, key)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(key)
+	end := strings.Index(tag[start:], `"`)
+	if end < 0 {
+		return ""
+	}
+	return tag[start : start+end]
+}
+
 var mdLinkRe = regexp.MustCompile(`\[([^\]]*)\]\(([^)]+)\)`)
 
 // sanitizeMarkdownURLs rewrites markdown links with non-HTTP(S) schemes
@@ -1920,6 +1958,26 @@ func parseInlineMarkdown(line string) []map[string]any {
 	remaining := line
 
 	for len(remaining) > 0 {
+		// Check for <at user_id="...">@name</at> mention tags
+		if atIdx := strings.Index(remaining, "<at "); atIdx >= 0 {
+			atClose := strings.Index(remaining[atIdx:], "</at>")
+			if atClose >= 0 {
+				atClose += atIdx
+				// Emit text before <at>
+				if atIdx > 0 {
+					elements = append(elements, map[string]any{"tag": "text", "text": remaining[:atIdx]})
+				}
+				atTag := remaining[atIdx : atClose+len("</at>")]
+				userID := extractAttrValue(atTag, "user_id")
+				elements = append(elements, map[string]any{
+					"tag":     "at",
+					"user_id": userID,
+				})
+				remaining = remaining[atClose+len("</at>"):]
+				continue
+			}
+		}
+
 		// Check for link [text](url)
 		linkIdx := strings.Index(remaining, "[")
 		if linkIdx >= 0 {
@@ -2032,26 +2090,53 @@ func findSingleAsterisk(s string) int {
 	return -1
 }
 
-// fetchBotOpenID retrieves the bot's open_id via the Feishu bot info API.
-func (p *Platform) fetchBotOpenID() (string, error) {
+// fetchBotInfo retrieves the bot's open_id and display name via the Feishu bot info API.
+func (p *Platform) fetchBotInfo() (openID, name string, err error) {
 	resp, err := p.client.Get(context.Background(),
 		"/open-apis/bot/v3/info", nil, larkcore.AccessTokenTypeTenant)
 	if err != nil {
-		return "", fmt.Errorf("api call: %w", err)
+		return "", "", fmt.Errorf("api call: %w", err)
 	}
 	var result struct {
 		Code int `json:"code"`
 		Bot  struct {
-			OpenID string `json:"open_id"`
+			OpenID  string `json:"open_id"`
+			AppName string `json:"app_name"`
 		} `json:"bot"`
 	}
 	if err := json.Unmarshal(resp.RawBody, &result); err != nil {
-		return "", fmt.Errorf("parse response: %w", err)
+		return "", "", fmt.Errorf("parse response: %w", err)
 	}
 	if result.Code != 0 {
-		return "", fmt.Errorf("api code=%d", result.Code)
+		return "", "", fmt.Errorf("api code=%d", result.Code)
 	}
-	return result.Bot.OpenID, nil
+	return result.Bot.OpenID, result.Bot.AppName, nil
+}
+
+// BotUserID returns the bot's open_id for cross-engine mention resolution.
+func (p *Platform) BotUserID() string {
+	return p.botOpenID
+}
+
+// BotDisplayName returns the bot's display name on the platform.
+func (p *Platform) BotDisplayName() string {
+	return p.botName
+}
+
+// FormatMentions prepends Feishu <at> tags to the message content.
+// Note: Feishu open_id is app-specific, so cross-app <at> tags may not
+// trigger native mention events. The API layer handles internal delivery
+// to mentioned bots separately.
+func (p *Platform) FormatMentions(content string, mentions []core.MentionInfo, chatID string) string {
+	if len(mentions) == 0 {
+		return content
+	}
+	var b strings.Builder
+	for _, m := range mentions {
+		fmt.Fprintf(&b, `<at user_id="%s">@%s</at> `, m.UserID, m.DisplayName)
+	}
+	b.WriteString(content)
+	return b.String()
 }
 
 func isBotMentioned(mentions []*larkim.MentionEvent, botOpenID string) bool {
@@ -2424,14 +2509,14 @@ func progressStateMeta(state core.ProgressCardState, lang string, agent string) 
 	switch state {
 	case core.ProgressCardStateCompleted:
 		if zh {
-			return fmt.Sprintf("%s · 已完成", agent), "green", "本过程卡片已停止更新，完整答复见下一条消息。"
+			return fmt.Sprintf("%s · 已完成", agent), "green", ""
 		}
-		return fmt.Sprintf("%s · Completed", agent), "green", "This progress card is no longer updating. Full response is in the next message."
+		return fmt.Sprintf("%s · Completed", agent), "green", ""
 	case core.ProgressCardStateFailed:
 		if zh {
-			return fmt.Sprintf("%s · 失败", agent), "red", "本过程卡片已停止更新（失败），完整错误说明见下一条消息。"
+			return fmt.Sprintf("%s · 失败", agent), "red", ""
 		}
-		return fmt.Sprintf("%s · Failed", agent), "red", "This progress card has stopped (failed). See the next message for details."
+		return fmt.Sprintf("%s · Failed", agent), "red", ""
 	default:
 		if zh {
 			return fmt.Sprintf("%s · 进行中", agent), "blue", ""
@@ -2498,6 +2583,49 @@ func normalizeProgressItems(payload *core.ProgressCardPayload) []core.ProgressCa
 		out = append(out, core.ProgressCardEntry{Kind: kind, Text: entry})
 	}
 	return out
+}
+
+// progressMetricsLine builds a human-readable metrics string for progress card footers.
+// Example: "⏱ 12.3s | tokens: 1.2k↑ 3.5k↓ | ctx: ~42%"
+func progressMetricsLine(payload *core.ProgressCardPayload) string {
+	if payload == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	if payload.DurationMs > 0 {
+		secs := float64(payload.DurationMs) / 1000
+		if secs < 60 {
+			parts = append(parts, fmt.Sprintf("⏱ %.1fs", secs))
+		} else {
+			m := int(secs) / 60
+			s := secs - float64(m*60)
+			parts = append(parts, fmt.Sprintf("⏱ %dm%.0fs", m, s))
+		}
+	}
+	if payload.InputTokens > 0 || payload.OutputTokens > 0 {
+		fmtTok := func(n int) string {
+			if n < 1000 {
+				return fmt.Sprintf("%d", n)
+			}
+			return fmt.Sprintf("%.1fk", float64(n)/1000)
+		}
+		parts = append(parts, fmt.Sprintf("tokens: %s↑ %s↓", fmtTok(payload.InputTokens), fmtTok(payload.OutputTokens)))
+	}
+	if payload.InputTokens > 0 {
+		const ctxWindow = 200_000
+		pct := payload.InputTokens * 100 / ctxWindow
+		if pct > 100 {
+			pct = 100
+		}
+		parts = append(parts, fmt.Sprintf("ctx: ~%d%%", pct))
+	}
+	if payload.Model != "" {
+		parts = append(parts, payload.Model)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " | ")
 }
 
 func inlineCodeText(s string) string {
@@ -2745,6 +2873,16 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 		elements = append(elements, renderProgressEntryElement(item, payload.Lang))
 		if i < len(items)-1 {
 			elements = append(elements, map[string]any{"tag": "hr"})
+		}
+	}
+	// Append metrics (duration, tokens, model) to footer when completed/failed.
+	if payload.State == core.ProgressCardStateCompleted || payload.State == core.ProgressCardStateFailed {
+		if metricsLine := progressMetricsLine(payload); metricsLine != "" {
+			if footer != "" {
+				footer += "\n" + metricsLine
+			} else {
+				footer = metricsLine
+			}
 		}
 	}
 	if footer != "" {

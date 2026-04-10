@@ -106,7 +106,23 @@ Do NOT guess or modify the name — use it exactly as shown (e.g. "gemini", not 
 This sends a message to the target bot and waits for its response (printed to stdout).
 The conversation is visible in the group chat and each bot maintains its own relay session.
 
+IMPORTANT rules for relay:
+- Do NOT add formatting prefixes like [project_name], [from → to], or similar brackets. cc-connect handles routing and display automatically.
+- After a relay call completes, do NOT post a redundant confirmation message (e.g. "已转达", "已完成"). The target bot's response is already visible in the group chat. Only respond if you need to add meaningful commentary or if the target's response seems problematic.
+
 Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so the relay knows which group chat to use.
+
+### @mention another bot (handoff)
+When you need to hand off work to another bot without waiting for a response, use:
+
+  cc-connect send --mention <target_project> -m "<message>"
+
+This sends a message in the group chat that @mentions the target bot, triggering it to process the message.
+Use this for workflow handoffs (e.g. dev → test, product → dev).
+
+Examples:
+  cc-connect send --mention wanglei -m "代码完成，请测试 XXX 功能"
+  cc-connect send --mention chenfeng -m "遇到性能瓶颈，需要帮助"
 `
 }
 
@@ -116,6 +132,27 @@ Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so the rela
 // memory/instruction file for relay and cron to work.
 type SystemPromptSupporter interface {
 	HasSystemPromptSupport() bool
+}
+
+// BotIdentifier is an optional interface for platforms that expose their
+// bot's user ID (e.g. Feishu open_id). Used by the relay/send system to
+// resolve @mention targets across engines.
+type BotIdentifier interface {
+	BotUserID() string
+	BotDisplayName() string // bot's display name on the platform (e.g. Feishu app_name)
+}
+
+// MentionInfo carries a resolved mention target for cross-bot @mentions.
+type MentionInfo struct {
+	UserID      string // platform user ID (e.g. Feishu open_id) — may be in the target's own namespace
+	DisplayName string // human-readable name (project name)
+	BotName     string // bot's platform display name, used to match across app namespaces
+}
+
+// MentionFormatter is an optional interface for platforms that can format
+// @mention tags in outgoing message content (e.g. Feishu <at> tags).
+type MentionFormatter interface {
+	FormatMentions(content string, mentions []MentionInfo, chatID string) string
 }
 
 // TypingIndicator is an optional interface for platforms that can show a

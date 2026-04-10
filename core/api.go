@@ -24,6 +24,7 @@ type APIServer struct {
 	cron       *CronScheduler
 	relay      *RelayManager
 	mu         sync.RWMutex
+
 }
 
 // SendRequest is the JSON body for POST /send.
@@ -33,6 +34,7 @@ type SendRequest struct {
 	Message    string            `json:"message"`
 	Images     []ImageAttachment `json:"images,omitempty"`
 	Files      []FileAttachment  `json:"files,omitempty"`
+	Mentions   []string          `json:"mentions,omitempty"` // project names to @mention
 }
 
 // NewAPIServer creates an API server on a Unix socket.
@@ -167,9 +169,44 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := engine.SendToSessionWithAttachments(req.SessionKey, req.Message, req.Images, req.Files); err != nil {
+	// Resolve @mention targets: look up bot open_ids from sibling engines
+	var mentions []MentionInfo
+	for _, proj := range req.Mentions {
+		s.mu.RLock()
+		targetEngine, found := s.engines[proj]
+		s.mu.RUnlock()
+		if !found {
+			http.Error(w, fmt.Sprintf("mention target %q not found", proj), http.StatusBadRequest)
+			return
+		}
+		if mi, resolved := targetEngine.ResolveBotMention(proj); resolved {
+			mentions = append(mentions, mi)
+		} else {
+			slog.Warn("send: could not resolve bot mention", "project", proj)
+		}
+	}
+
+	if err := engine.SendToSessionWithAttachments(req.SessionKey, req.Message, req.Images, req.Files, mentions); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Deliver the message to each mentioned bot's engine internally.
+	// Feishu open_id is app-specific, so native <at> tags don't trigger
+	// cross-app mention events. We bypass this by injecting the message
+	// directly into the target engine's active session for the same chat.
+	if len(req.Mentions) > 0 {
+		_, chatID, _ := parseSessionKeyParts(req.SessionKey)
+		if chatID != "" {
+			for _, proj := range req.Mentions {
+				s.mu.RLock()
+				targetEngine := s.engines[proj]
+				s.mu.RUnlock()
+				if targetEngine != nil {
+					targetEngine.DeliverMention(chatID, req.Message, req.Project)
+				}
+			}
+		}
 	}
 
 	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})

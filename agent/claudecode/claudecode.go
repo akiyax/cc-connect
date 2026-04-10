@@ -276,9 +276,17 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		// Disable telemetry and cost warnings for cleaner router integration
 		extraEnv = append(extraEnv, "DISABLE_TELEMETRY=true")
 		extraEnv = append(extraEnv, "DISABLE_COST_WARNINGS=true")
+		// Disable Vertex/Bedrock so Claude Code uses ANTHROPIC_BASE_URL
+		extraEnv = append(extraEnv, "CLAUDE_CODE_USE_VERTEX=")
+		extraEnv = append(extraEnv, "CLAUDE_CODE_USE_BEDROCK=")
+		extraEnv = append(extraEnv, "ANTHROPIC_VERTEX_PROJECT_ID=")
+		extraEnv = append(extraEnv, "GOOGLE_APPLICATION_CREDENTIALS=")
 	}
 	if a.routerAPIKey != "" {
 		extraEnv = append(extraEnv, "ANTHROPIC_API_KEY="+a.routerAPIKey)
+	} else if a.routerURL != "" {
+		// Router accepts any API key; set a dummy one so Claude Code doesn't complain
+		extraEnv = append(extraEnv, "ANTHROPIC_API_KEY=router")
 	}
 
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
@@ -287,9 +295,8 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	platformPrompt := a.platformPrompt
-	// When router_url is set, --verbose conflicts with --output-format stream-json
-	// (verbose emits non-JSON text to stdout that corrupts the JSON stream).
-	disableVerbose := a.routerURL != ""
+	// Newer Claude Code versions require --verbose with --output-format stream-json.
+	disableVerbose := false
 	a.mu.Unlock()
 
 	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok)
@@ -699,6 +706,11 @@ func (a *Agent) providerEnvLocked() []string {
 			env = append(env, "ANTHROPIC_AUTH_TOKEN="+p.APIKey)
 			env = append(env, "ANTHROPIC_API_KEY=")
 		}
+		// Disable Vertex/Bedrock so Claude Code uses ANTHROPIC_BASE_URL
+		env = append(env, "CLAUDE_CODE_USE_VERTEX=")
+		env = append(env, "CLAUDE_CODE_USE_BEDROCK=")
+		env = append(env, "ANTHROPIC_VERTEX_PROJECT_ID=")
+		env = append(env, "GOOGLE_APPLICATION_CREDENTIALS=")
 	} else {
 		a.stopProviderProxyLocked()
 		if p.APIKey != "" {

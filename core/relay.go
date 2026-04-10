@@ -213,19 +213,24 @@ func (rm *RelayManager) Send(ctx context.Context, req RelayRequest) (*RelayRespo
 		return nil, fmt.Errorf("relay: target engine %q not found (is the project running?)", req.To)
 	}
 
-	fromName := req.From
-	if binding.Bots[req.From] != "" {
-		fromName = binding.Bots[req.From]
-	}
-	toName := req.To
-	if binding.Bots[req.To] != "" {
-		toName = binding.Bots[req.To]
-	}
+	// Resolve display names from platform bot info
+	toDisplayName := rm.resolveBotDisplayName(req.To)
 
-	// Post the forwarded message to the group chat for visibility
+	// Post the forwarded message to the group chat with a native @mention
 	groupSessionKey := platform + ":" + chatID + ":relay"
 	if sourceEngine != nil {
-		label := fmt.Sprintf("[%s → %s] %s", fromName, toName, req.Message)
+		label := req.Message
+		if mi, ok := targetEngine.ResolveBotMention(req.To); ok {
+			// Use the source engine's platform to format the <at> tag
+			for _, p := range sourceEngine.platforms {
+				if mf, ok := p.(MentionFormatter); ok {
+					label = mf.FormatMentions(label, []MentionInfo{mi}, chatID)
+					break
+				}
+			}
+		} else {
+			label = fmt.Sprintf("@%s %s", toDisplayName, req.Message)
+		}
 		rm.sendToGroup(ctx, sourceEngine, platform, groupSessionKey, label)
 	}
 
@@ -233,18 +238,17 @@ func (rm *RelayManager) Send(ctx context.Context, req RelayRequest) (*RelayRespo
 	relayCtx, cancel := rm.relayContext(ctx)
 	defer cancel()
 
-	response, err := targetEngine.HandleRelay(relayCtx, req.From, chatID, req.Message)
+	response, err := targetEngine.HandleRelay(relayCtx, req.From, binding.Platform, chatID, req.Message)
 	if err != nil {
 		return nil, fmt.Errorf("relay: %w", err)
 	}
 
-	// Post the response to the group chat for visibility
-	if targetEngine != nil {
-		label := fmt.Sprintf("[%s] %s", toName, truncateRelay(response, 2000))
-		rm.sendToGroup(ctx, targetEngine, platform, groupSessionKey, label)
+	// Post the response to the group chat from the target bot's account
+	if targetEngine != nil && response != "" {
+		rm.sendToGroup(ctx, targetEngine, platform, groupSessionKey, response)
 	}
 
-	return &RelayResponse{Response: response}, nil
+	return &RelayResponse{Response: ""}, nil
 }
 
 // sendToGroup sends a message to the group chat for visibility.
@@ -285,6 +289,23 @@ func (rm *RelayManager) relayContext(ctx context.Context) (context.Context, cont
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)
+}
+
+// resolveBotDisplayName returns the platform display name for a project.
+// Falls back to the project name if the bot info is not available.
+func (rm *RelayManager) resolveBotDisplayName(projectName string) string {
+	engine := rm.engines[projectName]
+	if engine == nil {
+		return projectName
+	}
+	for _, p := range engine.platforms {
+		if bi, ok := p.(BotIdentifier); ok {
+			if name := bi.BotDisplayName(); name != "" {
+				return name
+			}
+		}
+	}
+	return projectName
 }
 
 func parseSessionKeyParts(sessionKey string) (platform, chatID string, err error) {

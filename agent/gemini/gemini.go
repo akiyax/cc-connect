@@ -220,6 +220,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
+	// Set IPC directory for ask_user MCP server
+	askUserDir := filepath.Join(workDir, ".cc-connect", "ask-user")
+	extraEnv = append(extraEnv, "CC_ASK_USER_DIR="+askUserDir)
+
 	return newGeminiSession(ctx, cmd, workDir, model, mode, sessionID, extraEnv, timeout)
 }
 

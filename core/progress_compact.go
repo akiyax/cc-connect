@@ -56,13 +56,17 @@ type ProgressCardEntry struct {
 // ProgressCardPayload carries structured progress entries for platforms that
 // render custom progress cards.
 type ProgressCardPayload struct {
-	Version   int                 `json:"version,omitempty"`
-	Agent     string              `json:"agent,omitempty"`
-	Lang      string              `json:"lang,omitempty"`
-	State     ProgressCardState   `json:"state,omitempty"`
-	Entries   []string            `json:"entries,omitempty"` // legacy fallback
-	Items     []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
-	Truncated bool                `json:"truncated"`
+	Version      int                 `json:"version,omitempty"`
+	Agent        string              `json:"agent,omitempty"`
+	Lang         string              `json:"lang,omitempty"`
+	State        ProgressCardState   `json:"state,omitempty"`
+	Entries      []string            `json:"entries,omitempty"` // legacy fallback
+	Items        []ProgressCardEntry `json:"items,omitempty"`   // ordered typed events
+	Truncated    bool                `json:"truncated"`
+	InputTokens  int                 `json:"input_tokens,omitempty"`
+	OutputTokens int                 `json:"output_tokens,omitempty"`
+	DurationMs   int64               `json:"duration_ms,omitempty"`
+	Model        string              `json:"model,omitempty"`
 }
 
 // BuildProgressCardPayload encodes progress entries into a transport string.
@@ -89,8 +93,21 @@ func BuildProgressCardPayload(entries []string, truncated bool) string {
 	return ProgressCardPayloadPrefix + string(b)
 }
 
+// ProgressCardPayloadOption is a functional option for BuildProgressCardPayloadV2.
+type ProgressCardPayloadOption func(*ProgressCardPayload)
+
+// WithMetrics adds token/duration/model metrics to the payload.
+func WithMetrics(inputTokens, outputTokens int, durationMs int64, model string) ProgressCardPayloadOption {
+	return func(p *ProgressCardPayload) {
+		p.InputTokens = inputTokens
+		p.OutputTokens = outputTokens
+		p.DurationMs = durationMs
+		p.Model = model
+	}
+}
+
 // BuildProgressCardPayloadV2 encodes ordered typed progress events.
-func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState) string {
+func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent string, lang Language, state ProgressCardState, opts ...ProgressCardPayloadOption) string {
 	cleaned := make([]ProgressCardEntry, 0, len(items))
 	for _, item := range items {
 		text := strings.TrimSpace(item.Text)
@@ -123,6 +140,10 @@ func BuildProgressCardPayloadV2(items []ProgressCardEntry, truncated bool, agent
 		State:     state,
 		Items:     cleaned,
 		Truncated: truncated,
+		// Metrics are set via opts when available.
+	}
+	for _, opt := range opts {
+		opt(&payload)
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -227,6 +248,12 @@ type compactProgressWriter struct {
 	truncated  bool
 	lastSent   string
 	maxEntries int
+
+	// Metrics populated before Finalize for inclusion in the final card.
+	inputTokens  int
+	outputTokens int
+	durationMs   int64
+	model        string
 }
 
 func normalizeProgressStyle(style string) string {
@@ -455,6 +482,14 @@ func (w *compactProgressWriter) AppendStructured(item ProgressCardEntry, fallbac
 	return true
 }
 
+// SetMetrics stores token/duration/model metrics for inclusion in the finalized card.
+func (w *compactProgressWriter) SetMetrics(inputTokens, outputTokens int, durationMs int64, model string) {
+	w.inputTokens = inputTokens
+	w.outputTokens = outputTokens
+	w.durationMs = durationMs
+	w.model = model
+}
+
 // Finalize updates card progress state (running/completed/failed) without
 // appending a new progress entry.
 func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
@@ -468,7 +503,11 @@ func (w *compactProgressWriter) Finalize(state ProgressCardState) bool {
 		return true
 	}
 	w.state = state
-	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state)
+	var opts []ProgressCardPayloadOption
+	if w.inputTokens > 0 || w.outputTokens > 0 || w.durationMs > 0 || w.model != "" {
+		opts = append(opts, WithMetrics(w.inputTokens, w.outputTokens, w.durationMs, w.model))
+	}
+	w.content = BuildProgressCardPayloadV2(w.items, w.truncated, w.agentName, w.lang, w.state, opts...)
 	if w.content == "" || w.content == w.lastSent {
 		return w.content != ""
 	}

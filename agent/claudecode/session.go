@@ -100,7 +100,7 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 		args = append(args, "--max-context-tokens", strconv.Itoa(maxContextTokens))
 	}
 
-	slog.Debug("claudeSession: starting", "args", core.RedactArgs(args), "dir", workDir, "mode", mode)
+	slog.Info("claudeSession: starting", "args", core.RedactArgs(args), "dir", workDir, "mode", mode)
 
 	cmd := exec.CommandContext(sessionCtx, "claude", args...)
 	cmd.Dir = workDir
@@ -267,6 +267,7 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 			}
 		case "text":
 			if text, ok := item["text"].(string); ok && text != "" {
+				text = strings.TrimLeft(text, "\n")
 				evt := core.Event{Type: core.EventText, Content: text}
 				select {
 				case cs.events <- evt:
@@ -313,13 +314,35 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	}
 
 	var inputTokens, outputTokens int
+
+	// Debug: log all top-level keys in the result event
+	topKeys := make([]string, 0, len(raw))
+	for k := range raw {
+		topKeys = append(topKeys, k)
+	}
+	slog.Info("claudeSession: result top-level keys", "keys", strings.Join(topKeys, ","))
+
 	if usage, ok := raw["usage"].(map[string]any); ok {
 		if v, ok := usage["input_tokens"].(float64); ok {
-			inputTokens = int(v)
+			inputTokens += int(v)
+		}
+		if v, ok := usage["cache_creation_input_tokens"].(float64); ok {
+			inputTokens += int(v)
+		}
+		if v, ok := usage["cache_read_input_tokens"].(float64); ok {
+			inputTokens += int(v)
 		}
 		if v, ok := usage["output_tokens"].(float64); ok {
 			outputTokens = int(v)
 		}
+		// Debug: log raw usage keys
+		usageKeys := make([]string, 0, len(usage))
+		for k := range usage {
+			usageKeys = append(usageKeys, fmt.Sprintf("%s=%v", k, usage[k]))
+		}
+		slog.Info("claudeSession: usage fields", "fields", strings.Join(usageKeys, ", "))
+	} else {
+		slog.Info("claudeSession: NO usage field in result", "raw_type", fmt.Sprintf("%T", raw["usage"]))
 	}
 
 	evt := core.Event{
@@ -352,7 +375,7 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 	toolName, _ := request["tool_name"].(string)
 	input, _ := request["input"].(map[string]any)
 
-	if cs.autoApprove.Load() {
+	if cs.autoApprove.Load() && toolName != "AskUserQuestion" {
 		slog.Debug("claudeSession: auto-approving", "request_id", requestID, "tool", toolName)
 		_ = cs.RespondPermission(requestID, core.PermissionResult{
 			Behavior:     "allow",

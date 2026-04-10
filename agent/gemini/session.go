@@ -337,6 +337,26 @@ func (gs *geminiSession) handleToolUse(raw map[string]any) {
 	input := formatToolParams(toolName, params)
 
 	slog.Debug("geminiSession: tool_use", "tool", toolName, "id", toolID)
+
+	// Handle ask_user like Claude Code's AskUserQuestion — emit as
+	// EventPermissionRequest so the engine shows an interactive card.
+	// MCP tools are namespaced as "mcp_<server>_<tool>", so also match the suffix.
+	if toolName == "ask_user" || strings.HasSuffix(toolName, "_ask_user") {
+		evt := core.Event{
+			Type:         core.EventPermissionRequest,
+			RequestID:    toolID,
+			ToolName:     "AskUserQuestion",
+			ToolInput:    input,
+			ToolInputRaw: params,
+			Questions:    parseGeminiQuestions(params),
+		}
+		select {
+		case gs.events <- evt:
+		case <-gs.ctx.Done():
+		}
+		return
+	}
+
 	evt := core.Event{Type: core.EventToolUse, ToolName: toolName, ToolInput: input}
 	select {
 	case gs.events <- evt:
@@ -400,17 +420,30 @@ func (gs *geminiSession) handleResult(raw map[string]any) {
 		}
 	}
 
+	// Parse token usage from stats field.
+	var inputTokens, outputTokens int
+	if stats, ok := raw["stats"].(map[string]any); ok {
+		if v, ok := stats["input_tokens"].(float64); ok {
+			inputTokens = int(v)
+		}
+		if v, ok := stats["output_tokens"].(float64); ok {
+			outputTokens = int(v)
+		}
+	}
+
 	sid := gs.CurrentSessionID()
 
 	if errMsg != "" {
-		evt := core.Event{Type: core.EventResult, Content: errMsg, SessionID: sid, Done: true, Error: fmt.Errorf("%s", errMsg)}
+		evt := core.Event{Type: core.EventResult, Content: errMsg, SessionID: sid, Done: true, Error: fmt.Errorf("%s", errMsg),
+			InputTokens: inputTokens, OutputTokens: outputTokens}
 		select {
 		case gs.events <- evt:
 		case <-gs.ctx.Done():
 			return
 		}
 	} else {
-		evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true}
+		evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true,
+			InputTokens: inputTokens, OutputTokens: outputTokens}
 		select {
 		case gs.events <- evt:
 		case <-gs.ctx.Done():
@@ -449,9 +482,27 @@ func (gs *geminiSession) flushPendingAsText() {
 	}
 }
 
-// RespondPermission is a no-op — Gemini CLI permissions are handled via -y / --approval-mode flags.
-func (gs *geminiSession) RespondPermission(_ string, _ core.PermissionResult) error {
-	return nil
+// RespondPermission writes the user's response to the IPC file so the
+// ask_user MCP server can return it to the model.
+func (gs *geminiSession) RespondPermission(_ string, result core.PermissionResult) error {
+	askUserDir := filepath.Join(gs.workDir, ".cc-connect", "ask-user")
+	responseFile := filepath.Join(askUserDir, "response.json")
+
+	// Build response content from the permission result.
+	var response string
+	if result.UpdatedInput != nil {
+		if data, err := json.Marshal(result.UpdatedInput); err == nil {
+			response = string(data)
+		}
+	}
+	if response == "" {
+		response = result.Behavior // "allow" / "deny" / answer text
+	}
+
+	if err := os.MkdirAll(askUserDir, 0o755); err != nil {
+		return fmt.Errorf("gemini: create ask-user dir: %w", err)
+	}
+	return os.WriteFile(responseFile, []byte(response), 0o644)
 }
 
 func (gs *geminiSession) Events() <-chan core.Event {
@@ -567,7 +618,7 @@ func formatToolParams(toolName string, params map[string]any) string {
 		if f, ok := params["fact"].(string); ok {
 			return f
 		}
-	case "ask_user":
+	case "ask_user", "cc_ask_user":
 		if qs, ok := params["questions"].([]any); ok && len(qs) > 0 {
 			if q0, ok := qs[0].(map[string]any); ok {
 				if question, ok := q0["question"].(string); ok {
@@ -691,4 +742,49 @@ func truncate(s string, maxRunes int) string {
 		return s
 	}
 	return string([]rune(s)[:maxRunes]) + "..."
+}
+
+// parseGeminiQuestions parses ask_user parameters into UserQuestion structs.
+// Format mirrors Claude Code's AskUserQuestion: {"questions": [{"question":..., "options":[...]}]}
+func parseGeminiQuestions(params map[string]any) []core.UserQuestion {
+	questionsRaw, ok := params["questions"].([]any)
+	if !ok || len(questionsRaw) == 0 {
+		return nil
+	}
+	var questions []core.UserQuestion
+	for _, qRaw := range questionsRaw {
+		qMap, ok := qRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		q := core.UserQuestion{
+			Question: strVal(qMap, "question"),
+			Header:   strVal(qMap, "header"),
+		}
+		if ms, ok := qMap["multiSelect"].(bool); ok {
+			q.MultiSelect = ms
+		}
+		if optsRaw, ok := qMap["options"].([]any); ok {
+			for _, oRaw := range optsRaw {
+				switch o := oRaw.(type) {
+				case string:
+					q.Options = append(q.Options, core.UserQuestionOption{Label: o})
+				case map[string]any:
+					q.Options = append(q.Options, core.UserQuestionOption{
+						Label:       strVal(o, "label"),
+						Description: strVal(o, "description"),
+					})
+				}
+			}
+		}
+		if q.Question != "" {
+			questions = append(questions, q)
+		}
+	}
+	return questions
+}
+
+func strVal(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
 }

@@ -107,6 +107,12 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 			}
 			i++
 			filePaths = append(filePaths, args[i])
+		case "--mention":
+			if i+1 >= len(args) {
+				return req, "", fmt.Errorf("--mention requires a project name")
+			}
+			i++
+			req.Mentions = append(req.Mentions, args[i])
 		case "--stdin":
 			useStdin = true
 		case "--data-dir":
@@ -256,6 +262,7 @@ Options:
   -m, --message <text>     Message to send (preferred over positional args)
       --image <path>       Send an image attachment (repeatable)
       --file <path>        Send a file attachment (repeatable)
+      --mention <project>  @mention another bot by project name (repeatable)
       --stdin              Read message from stdin (best for long/special-char messages)
   -p, --project <name>     Target project (optional if only one project)
   -s, --session <key>      Target session key (optional, picks first active)
@@ -267,6 +274,7 @@ Examples:
   cc-connect send -m "Build completed successfully"
   cc-connect send --message "Chart generated" --image /tmp/chart.png
   cc-connect send --file /tmp/report.pdf
+  cc-connect send --mention wanglei -m "代码完成，请测试"
   cc-connect send --stdin <<'EOF'
     Long message with "special" chars, $variables, and newlines
   EOF`)

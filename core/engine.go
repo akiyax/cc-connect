@@ -2581,7 +2581,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventResult:
-			cp.Finalize(ProgressCardStateCompleted)
+			currentModel := ""
+			if ms, ok := e.agent.(ModelSwitcher); ok {
+				currentModel = ms.GetModel()
+			}
+			cp.SetMetrics(event.InputTokens, event.OutputTokens, time.Since(turnStart).Milliseconds(), currentModel)
+			cardHasMetrics := cp.Finalize(ProgressCardStateCompleted)
 			if event.SessionID != "" {
 				session.SetAgentSessionID(event.SessionID, e.agent.Name())
 			}
@@ -2591,7 +2596,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				fullResponse = strings.Join(textParts, "")
 			}
 			if fullResponse == "" {
-				fullResponse = e.i18n.T(MsgEmptyResponse)
+				// Empty response: silently suppress rather than broadcasting "(empty response)".
+				// This covers both tool-use-only turns and intentional non-responses
+				// (e.g. group_reply_all where the agent chose not to respond).
+				slog.Debug("EventResult: empty response, suppressing",
+					"session", session.ID, "tools", toolCount)
+				if event.SessionID != "" {
+					session.SetAgentSessionID(event.SessionID, e.agent.Name())
+				}
+				session.AddHistory("assistant", "")
+				sessions.Save()
+				sp.discard()
+				return
 			}
 
 			// Context usage indicator: prefer SDK tokens, fall back to self-reported.
@@ -2619,16 +2635,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			session.AddHistory("assistant", cleanResponse)
 			sessions.Save()
 
-			if e.showContextIndicator {
+			turnDuration := time.Since(turnStart)
+
+			if e.showContextIndicator && !cardHasMetrics {
 				if sdkPlausible {
-					cleanResponse += contextIndicator(event.InputTokens)
+					cleanResponse += turnMetrics(turnDuration, event.InputTokens, event.OutputTokens, currentModel)
 				} else if selfPct > 0 {
-					cleanResponse += fmt.Sprintf("\n[ctx: ~%d%%]", selfPct)
+					cleanResponse += turnMetrics(turnDuration, 0, 0, currentModel)
 				}
 			}
 			fullResponse = cleanResponse
 
-			turnDuration := time.Since(turnStart)
 			slog.Info("turn complete",
 				"session", session.ID,
 				"agent_session", session.GetAgentSessionID(),
@@ -6063,7 +6080,116 @@ func (e *Engine) SendToSession(sessionKey, message string) error {
 	return e.SendToSessionWithAttachments(sessionKey, message, nil, nil)
 }
 
-func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images []ImageAttachment, files []FileAttachment) error {
+// ResolveBotMention returns the MentionInfo for this engine's bot by querying
+// the first platform that implements BotIdentifier.
+func (e *Engine) ResolveBotMention(projectName string) (MentionInfo, bool) {
+	for _, p := range e.platforms {
+		if bi, ok := p.(BotIdentifier); ok {
+			uid := bi.BotUserID()
+			if uid != "" {
+				return MentionInfo{
+					UserID:      uid,
+					DisplayName: projectName,
+					BotName:     bi.BotDisplayName(),
+				}, true
+			}
+		}
+	}
+	return MentionInfo{}, false
+}
+
+// DeliverMention injects a message into this engine as if it were an incoming
+// user message. It finds an active session whose key contains the given chatID
+// and delivers the message there. This is used for cross-bot @mentions where
+// Feishu's native mention mechanism doesn't work across different apps.
+func (e *Engine) DeliverMention(chatID, message, senderName string) bool {
+	e.interactiveMu.Lock()
+	var targetKey string
+	var state *interactiveState
+	for key, s := range e.interactiveStates {
+		if strings.Contains(key, chatID) {
+			targetKey = key
+			state = s
+			break
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	var p Platform
+	var replyCtx any
+
+	if state != nil {
+		state.mu.Lock()
+		p = state.platform
+		state.mu.Unlock()
+
+		if p == nil {
+			return false
+		}
+
+		// Reconstruct a fresh replyCtx with only chatID (no messageID) so the
+		// bot's response is sent as a new standalone message in the group chat,
+		// rather than as a reply to the user's last message in the session.
+		if rc, ok := p.(ReplyContextReconstructor); ok {
+			var err error
+			replyCtx, err = rc.ReconstructReplyCtx(targetKey)
+			if err != nil {
+				slog.Warn("DeliverMention: failed to reconstruct replyCtx, using session replyCtx",
+					"error", err, "engine", e.name)
+				state.mu.Lock()
+				replyCtx = state.replyCtx
+				state.mu.Unlock()
+			}
+		} else {
+			state.mu.Lock()
+			replyCtx = state.replyCtx
+			state.mu.Unlock()
+		}
+	} else {
+		// No active interactive state for this chat. Find the platform and
+		// construct a synthetic session key so handleMessage can bootstrap
+		// a new session automatically.
+		for _, plat := range e.platforms {
+			if rc, ok := plat.(ReplyContextReconstructor); ok {
+				// Build a minimal session key: {platformName}:{chatID}:mention
+				syntheticKey := plat.Name() + ":" + chatID + ":mention"
+				var err error
+				replyCtx, err = rc.ReconstructReplyCtx(syntheticKey)
+				if err != nil {
+					continue
+				}
+				p = plat
+				targetKey = syntheticKey
+				break
+			}
+		}
+		if p == nil {
+			slog.Warn("DeliverMention: no active session and no suitable platform for chat",
+				"chat_id", chatID, "engine", e.name)
+			return false
+		}
+		slog.Info("DeliverMention: bootstrapping new session",
+			"chat_id", chatID, "engine", e.name, "session_key", targetKey)
+	}
+
+	content := message
+	if senderName != "" {
+		content = fmt.Sprintf("[from @%s] %s", senderName, message)
+	}
+
+	go e.handleMessage(p, &Message{
+		SessionKey: targetKey,
+		Platform:   p.Name(),
+		Content:    content,
+		ReplyCtx:   replyCtx,
+	})
+
+	slog.Info("DeliverMention: message delivered",
+		"chat_id", chatID, "engine", e.name, "sender", senderName)
+	return true
+}
+
+func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images []ImageAttachment, files []FileAttachment, mentions ...[]MentionInfo) error {
 	e.interactiveMu.Lock()
 
 	var state *interactiveState
@@ -6167,6 +6293,22 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		fileSender, ok = p.(FileSender)
 		if !ok {
 			return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
+		}
+	}
+
+	// Apply @mention formatting if mentions were provided
+	var resolvedMentions []MentionInfo
+	if len(mentions) > 0 {
+		resolvedMentions = mentions[0]
+	}
+	if len(resolvedMentions) > 0 && message != "" {
+		if mf, ok := p.(MentionFormatter); ok {
+			// Extract chatID from sessionKey (format: "platform:chatID:userID")
+			chatID := ""
+			if parts := strings.SplitN(sessionKey, ":", 3); len(parts) >= 2 {
+				chatID = parts[1]
+			}
+			message = mf.FormatMentions(message, resolvedMentions, chatID)
 		}
 	}
 
@@ -9514,8 +9656,8 @@ func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 // HandleRelay processes a relay message synchronously: starts or resumes a
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
-func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message string) (string, error) {
-	relaySessionKey := "relay:" + fromProject + ":" + chatID
+func (e *Engine) HandleRelay(ctx context.Context, fromProject, platform, chatID, message string) (string, error) {
+	relaySessionKey := platform + ":" + chatID
 	session := e.sessions.GetOrCreateActive(relaySessionKey)
 
 	if inj, ok := e.agent.(SessionEnvInjector); ok {
@@ -9592,9 +9734,6 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 			resp := event.Content
 			if resp == "" && len(textParts) > 0 {
 				resp = strings.Join(textParts, "")
-			}
-			if resp == "" {
-				resp = "(empty response)"
 			}
 			slog.Info("relay: turn complete", "from", fromProject, "to", e.name, "response_len", len(resp))
 			agentSession.Close()
@@ -10212,7 +10351,8 @@ func gitClone(repoURL, dest string) error {
 
 const modelContextWindow = 200_000 // Claude's context window size in tokens
 
-// contextIndicator returns a suffix like "\n[ctx: ~42%]" based on SDK-reported input tokens.
+// contextIndicator returns a suffix like "\n[ctx: ~42%]" based on SDK-reported token usage.
+// The context window is shared by input and output tokens.
 func contextIndicator(inputTokens int) string {
 	if inputTokens <= 0 {
 		return ""
@@ -10222,6 +10362,52 @@ func contextIndicator(inputTokens int) string {
 		pct = 100
 	}
 	return fmt.Sprintf("\n[ctx: ~%d%%]", pct)
+}
+
+// formatTokenCount formats a token count as a human-friendly string (e.g. 1234 → "1.2k").
+func formatTokenCount(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+// turnMetrics returns a suffix line with duration, token usage, context window percentage, and model.
+// Example: "\n[⏱ 12.3s | tokens: 1.2k↑ 3.5k↓ | ctx: ~42% | claude-sonnet-4-20250514]"
+func turnMetrics(dur time.Duration, inputTokens, outputTokens int, model string) string {
+	parts := make([]string, 0, 4)
+
+	// Duration
+	secs := dur.Seconds()
+	if secs < 60 {
+		parts = append(parts, fmt.Sprintf("⏱ %.1fs", secs))
+	} else {
+		m := int(secs) / 60
+		s := secs - float64(m*60)
+		parts = append(parts, fmt.Sprintf("⏱ %dm%.0fs", m, s))
+	}
+
+	// Tokens
+	if inputTokens > 0 || outputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("tokens: %s↑ %s↓", formatTokenCount(inputTokens), formatTokenCount(outputTokens)))
+	}
+
+	// Context window (input + output share the same window)
+	totalTokens := inputTokens + outputTokens
+	if totalTokens > 0 {
+		pct := totalTokens * 100 / modelContextWindow
+		if pct > 100 {
+			pct = 100
+		}
+		parts = append(parts, fmt.Sprintf("ctx: ~%d%%", pct))
+	}
+
+	// Model
+	if model != "" {
+		parts = append(parts, model)
+	}
+
+	return "\n[" + strings.Join(parts, " | ") + "]"
 }
 
 // ctxSelfReportRe matches agent self-reported context lines like "[ctx: ~42%]".

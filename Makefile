@@ -65,7 +65,7 @@ endif
 _BUILD_TAGS := $(strip $(_EXCLUDE_TAGS))
 _TAGS_FLAG  := $(if $(_BUILD_TAGS),-tags '$(_BUILD_TAGS)',)
 
-.PHONY: build run clean test test-fast test-full test-smoke test-e2e test-release test-performance pre-test lint release release-all web
+.PHONY: build run clean test test-fast test-full test-smoke test-e2e test-release test-performance pre-test lint release release-all web deploy
 
 web:
 	@if [ ! -d web/node_modules ]; then cd web && npm install; fi
@@ -79,6 +79,18 @@ build-noweb:
 
 run: build
 	./$(APP)
+
+# Deploy to the npm global install path.
+# Uses atomic mv (new inode) instead of cp (overwrite) so that macOS kernel
+# code-signature cache stays valid for the still-running server process.
+DEPLOY_TARGET ?= /opt/homebrew/lib/node_modules/cc-connect/bin/$(APP)
+
+deploy: build
+	@if [ "$(shell uname)" = "Darwin" ]; then codesign --force --sign - $(APP); fi
+	cp $(APP) $(DEPLOY_TARGET).tmp
+	mv -f $(DEPLOY_TARGET).tmp $(DEPLOY_TARGET)
+	@echo "Deployed $(APP) -> $(DEPLOY_TARGET)"
+	@echo "Send /restart in Feishu to reload the server."
 
 clean:
 	rm -f $(APP)
