@@ -34,18 +34,18 @@ func init() {
 //   - "auto":              Claude's automatic permission classifier
 //   - "bypassPermissions": auto-approve everything (alias: yolo)
 type Agent struct {
-	workDir          string
-	model            string
-	mode             string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
-	allowedTools     []string
-	disallowedTools  []string
+	workDir             string
+	model               string
+	mode                string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
+	allowedTools        []string
+	disallowedTools     []string
 	maxContextTokens    int // optional: passed as --max-context-tokens when > 0
 	disableSystemPrompt bool
 	providers           []core.ProviderConfig
-	activeIdx        int // -1 = no provider set
-	sessionEnv       []string
-	routerURL        string // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
-	routerAPIKey     string // Claude Code Router API key (optional)
+	activeIdx           int // -1 = no provider set
+	sessionEnv          []string
+	routerURL           string // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
+	routerAPIKey        string // Claude Code Router API key (optional)
 
 	providerProxy  *core.ProviderProxy // local proxy for third-party providers
 	proxyLocalURL  string              // local URL of the proxy
@@ -706,14 +706,21 @@ func (a *Agent) providerEnvLocked() []string {
 	p := a.providers[a.activeIdx]
 	var env []string
 
-	if p.BaseURL != "" {
+	// Determine the effective base URL: either from the base_url field or
+	// from ANTHROPIC_BASE_URL in the env map (legacy config style).
+	effectiveBaseURL := p.BaseURL
+	if effectiveBaseURL == "" {
+		effectiveBaseURL = p.Env["ANTHROPIC_BASE_URL"]
+	}
+
+	if effectiveBaseURL != "" {
 		// Use DedupProxy for all third-party providers. It deduplicates
 		// concurrent /messages requests from sdk-cli mode (which sends 2
 		// per turn) and optionally rewrites thinking.type if configured.
 		a.stopProviderProxyLocked() // stop old provider proxy if any
-		if err := a.ensureDedupProxyLocked(p.BaseURL, p.Thinking); err != nil {
+		if err := a.ensureDedupProxyLocked(effectiveBaseURL, p.Thinking); err != nil {
 			slog.Error("dedupproxy: failed to start, falling back to direct", "error", err)
-			env = append(env, "ANTHROPIC_BASE_URL="+p.BaseURL)
+			env = append(env, "ANTHROPIC_BASE_URL="+effectiveBaseURL)
 		} else {
 			env = append(env, "ANTHROPIC_BASE_URL="+a.dedupLocalURL)
 			env = append(env, "NO_PROXY=127.0.0.1")
@@ -736,6 +743,11 @@ func (a *Agent) providerEnvLocked() []string {
 	}
 
 	for k, v := range p.Env {
+		// Skip ANTHROPIC_BASE_URL if we already set it via the dedup proxy
+		// to avoid overwriting the proxy's local URL.
+		if k == "ANTHROPIC_BASE_URL" && effectiveBaseURL != "" && a.dedupProxy != nil {
+			continue
+		}
 		env = append(env, k+"="+v)
 	}
 	return env
@@ -768,7 +780,9 @@ func (a *Agent) ensureDedupProxyLocked(targetURL, thinkingOverride string) error
 		return nil
 	}
 	a.stopDedupProxyLocked()
-	proxy, localURL, err := core.NewDedupProxy(targetURL, thinkingOverride, 2.0)
+	// cooldown=5s: blocks the second same-turn request that arrives slightly
+	// after the first completes (~0.1s). User response time is typically >5s.
+	proxy, localURL, err := core.NewDedupProxy(targetURL, thinkingOverride, 5.0)
 	if err != nil {
 		return err
 	}

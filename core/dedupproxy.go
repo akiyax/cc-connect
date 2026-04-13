@@ -25,10 +25,10 @@ type DedupProxy struct {
 	server    *http.Server
 	once      sync.Once
 
-	mu        sync.Mutex
-	inFlight  bool    // is a /messages request currently in-flight?
-	lastDone  float64 // unix timestamp of last successful response
-	cooldown  float64 // seconds to wait after last response
+	mu       sync.Mutex
+	inFlight bool    // is a /messages request currently in-flight?
+	lastDone float64 // unix timestamp of last successful response
+	cooldown float64 // seconds to wait after last response
 }
 
 // NewDedupProxy creates and starts a local dedup reverse proxy.
@@ -75,10 +75,11 @@ func NewDedupProxy(targetURL, thinkingOverride string, cooldown float64) (*Dedup
 			if override != "" {
 				rewriteThinkingInRequest(r, override)
 			}
-			// Wrap ResponseWriter to detect completion
+			// Wrap ResponseWriter to detect completion.
+			// defer ensures inFlight is always released even on panic/error.
 			dw := &dedupResponseWriter{ResponseWriter: w, dp: dp}
+			defer dw.finish()
 			proxy.ServeHTTP(dw, r)
-			dw.finish()
 			return
 		}
 
