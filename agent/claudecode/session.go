@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -49,9 +50,13 @@ type claudeSession struct {
 	// Stop hook timeout. The wait ends as soon as the process exits,
 	// so typical shutdowns take seconds, not the full timeout.
 	gracefulStopTimeout time.Duration
+
+	// toolNames maps tool_use id → tool name so we can label tool results.
+	toolNames   map[string]string
+	toolNamesMu sync.Mutex
 }
 
-func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools, disallowedTools []string, extraEnv []string, platformPrompt string, disableVerbose bool, maxContextTokens int) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode string, allowedTools, disallowedTools []string, extraEnv []string, platformPrompt string, disableVerbose bool, maxContextTokens int, disableSystemPrompt bool) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	args := []string{
@@ -89,11 +94,13 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 		args = append(args, "--disallowedTools", strings.Join(disallowedTools, ","))
 	}
 
-	if sysPrompt := core.AgentSystemPrompt(); sysPrompt != "" {
-		if platformPrompt != "" {
-			sysPrompt += "\n## Formatting\n" + platformPrompt + "\n"
+	if !disableSystemPrompt {
+		if sysPrompt := core.AgentSystemPrompt(); sysPrompt != "" {
+			if platformPrompt != "" {
+				sysPrompt += "\n## Formatting\n" + platformPrompt + "\n"
+			}
+			args = append(args, "--append-system-prompt", sysPrompt)
 		}
-		args = append(args, "--append-system-prompt", sysPrompt)
 	}
 
 	if maxContextTokens > 0 {
@@ -111,6 +118,12 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 		env = core.MergeEnv(env, extraEnv)
 	}
 	cmd.Env = env
+	// Debug: log key env vars
+	for _, e := range env {
+		if strings.HasPrefix(e, "ANTHROPIC_BASE_URL=") || strings.HasPrefix(e, "NO_PROXY=") || strings.HasPrefix(e, "http_proxy=") || strings.HasPrefix(e, "https_proxy=") {
+			slog.Info("claudeSession: env", "var", e)
+		}
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -141,6 +154,7 @@ func newClaudeSession(ctx context.Context, workDir, model, sessionID, mode strin
 		cancel:              cancel,
 		done:                make(chan struct{}),
 		gracefulStopTimeout: 120 * time.Second,
+		toolNames:           make(map[string]string),
 	}
 	cs.setPermissionMode(mode)
 	cs.sessionID.Store(sessionID)
@@ -249,6 +263,11 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 			if toolName == "AskUserQuestion" {
 				continue
 			}
+			if toolID, ok := item["id"].(string); ok && toolID != "" {
+				cs.toolNamesMu.Lock()
+				cs.toolNames[toolID] = toolName
+				cs.toolNamesMu.Unlock()
+			}
 			inputSummary := summarizeInput(toolName, item["input"])
 			evt := core.Event{Type: core.EventToolUse, ToolName: toolName, ToolInput: inputSummary}
 			select {
@@ -296,9 +315,46 @@ func (cs *claudeSession) handleUser(raw map[string]any) {
 		contentType, _ := item["type"].(string)
 		if contentType == "tool_result" {
 			isError, _ := item["is_error"].(bool)
+			toolUseID, _ := item["tool_use_id"].(string)
+
+			// Resolve tool name from the id→name map.
+			var toolName string
+			if toolUseID != "" {
+				cs.toolNamesMu.Lock()
+				toolName = cs.toolNames[toolUseID]
+				delete(cs.toolNames, toolUseID)
+				cs.toolNamesMu.Unlock()
+			}
+
+			// Extract result content (can be string or structured).
+			var result string
+			switch v := item["content"].(type) {
+			case string:
+				result = v
+			case []any:
+				// Content blocks array — extract text parts.
+				var parts []string
+				for _, block := range v {
+					if b, ok := block.(map[string]any); ok {
+						if t, ok := b["text"].(string); ok {
+							parts = append(parts, t)
+						}
+					}
+				}
+				result = strings.Join(parts, "\n")
+			}
+
 			if isError {
-				result, _ := item["content"].(string)
-				slog.Debug("claudeSession: tool error", "content", result)
+				slog.Debug("claudeSession: tool error", "tool", toolName, "content", result)
+			}
+
+			if result != "" {
+				evt := core.Event{Type: core.EventToolResult, ToolName: toolName, ToolResult: truncateStr(result, 500)}
+				select {
+				case cs.events <- evt:
+				case <-cs.ctx.Done():
+					return
+				}
 			}
 		}
 	}
@@ -653,4 +709,11 @@ func filterEnv(env []string, key string) []string {
 		}
 	}
 	return out
+}
+
+func truncateStr(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return string([]rune(s)[:maxRunes]) + "..."
 }

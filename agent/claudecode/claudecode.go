@@ -39,8 +39,9 @@ type Agent struct {
 	mode             string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
 	allowedTools     []string
 	disallowedTools  []string
-	maxContextTokens int // optional: passed as --max-context-tokens when > 0
-	providers        []core.ProviderConfig
+	maxContextTokens    int // optional: passed as --max-context-tokens when > 0
+	disableSystemPrompt bool
+	providers           []core.ProviderConfig
 	activeIdx        int // -1 = no provider set
 	sessionEnv       []string
 	routerURL        string // Claude Code Router URL (e.g., "http://127.0.0.1:3456")
@@ -100,20 +101,26 @@ func New(opts map[string]any) (core.Agent, error) {
 	routerURL, _ := opts["router_url"].(string)
 	routerAPIKey, _ := opts["router_api_key"].(string)
 
+	disableSystemPrompt := false
+	if v, ok := opts["disable_system_prompt"].(bool); ok {
+		disableSystemPrompt = v
+	}
+
 	if _, err := exec.LookPath("claude"); err != nil {
 		return nil, fmt.Errorf("claudecode: 'claude' CLI not found in PATH, please install Claude Code first")
 	}
 
 	return &Agent{
-		workDir:          workDir,
-		model:            model,
-		mode:             mode,
-		allowedTools:     allowedTools,
-		disallowedTools:  disallowedTools,
-		maxContextTokens: maxContextTokens,
-		activeIdx:        -1,
-		routerURL:        routerURL,
-		routerAPIKey:     routerAPIKey,
+		workDir:             workDir,
+		model:               model,
+		mode:                mode,
+		allowedTools:        allowedTools,
+		disallowedTools:     disallowedTools,
+		maxContextTokens:    maxContextTokens,
+		disableSystemPrompt: disableSystemPrompt,
+		activeIdx:           -1,
+		routerURL:           routerURL,
+		routerAPIKey:        routerAPIKey,
 	}, nil
 }
 
@@ -295,11 +302,12 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		}
 	}
 	platformPrompt := a.platformPrompt
+	noSystemPrompt := a.disableSystemPrompt
 	// Newer Claude Code versions require --verbose with --output-format stream-json.
 	disableVerbose := false
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok)
+	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok, noSystemPrompt)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
