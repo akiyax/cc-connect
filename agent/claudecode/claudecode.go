@@ -49,6 +49,8 @@ type Agent struct {
 
 	providerProxy  *core.ProviderProxy // local proxy for third-party providers
 	proxyLocalURL  string              // local URL of the proxy
+	dedupProxy     *core.DedupProxy    // dedup proxy for rate-limited providers
+	dedupLocalURL  string              // local URL of the dedup proxy
 	platformPrompt string              // platform-specific formatting instructions
 
 	mu sync.RWMutex
@@ -517,7 +519,13 @@ func extractTextContent(raw json.RawMessage) string {
 	return ""
 }
 
-func (a *Agent) Stop() error { return nil }
+func (a *Agent) Stop() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopProviderProxyLocked()
+	a.stopDedupProxyLocked()
+	return nil
+}
 
 // SetMode changes the permission mode for future sessions.
 func (a *Agent) SetMode(mode string) {
@@ -692,23 +700,23 @@ func (a *Agent) ListProviders() []core.ProviderConfig {
 func (a *Agent) providerEnvLocked() []string {
 	if a.activeIdx < 0 || a.activeIdx >= len(a.providers) {
 		a.stopProviderProxyLocked()
+		a.stopDedupProxyLocked()
 		return nil
 	}
 	p := a.providers[a.activeIdx]
 	var env []string
 
 	if p.BaseURL != "" {
-		if p.Thinking != "" {
-			if err := a.ensureProviderProxyLocked(p.BaseURL, p.Thinking); err != nil {
-				slog.Error("providerproxy: failed to start", "error", err)
-				env = append(env, "ANTHROPIC_BASE_URL="+p.BaseURL)
-			} else {
-				env = append(env, "ANTHROPIC_BASE_URL="+a.proxyLocalURL)
-				env = append(env, "NO_PROXY=127.0.0.1")
-			}
-		} else {
-			a.stopProviderProxyLocked()
+		// Use DedupProxy for all third-party providers. It deduplicates
+		// concurrent /messages requests from sdk-cli mode (which sends 2
+		// per turn) and optionally rewrites thinking.type if configured.
+		a.stopProviderProxyLocked() // stop old provider proxy if any
+		if err := a.ensureDedupProxyLocked(p.BaseURL, p.Thinking); err != nil {
+			slog.Error("dedupproxy: failed to start, falling back to direct", "error", err)
 			env = append(env, "ANTHROPIC_BASE_URL="+p.BaseURL)
+		} else {
+			env = append(env, "ANTHROPIC_BASE_URL="+a.dedupLocalURL)
+			env = append(env, "NO_PROXY=127.0.0.1")
 		}
 		if p.APIKey != "" {
 			env = append(env, "ANTHROPIC_AUTH_TOKEN="+p.APIKey)
@@ -721,6 +729,7 @@ func (a *Agent) providerEnvLocked() []string {
 		env = append(env, "GOOGLE_APPLICATION_CREDENTIALS=")
 	} else {
 		a.stopProviderProxyLocked()
+		a.stopDedupProxyLocked()
 		if p.APIKey != "" {
 			env = append(env, "ANTHROPIC_API_KEY="+p.APIKey)
 		}
@@ -751,6 +760,28 @@ func (a *Agent) stopProviderProxyLocked() {
 		a.providerProxy.Close()
 		a.providerProxy = nil
 		a.proxyLocalURL = ""
+	}
+}
+
+func (a *Agent) ensureDedupProxyLocked(targetURL, thinkingOverride string) error {
+	if a.dedupProxy != nil && a.dedupLocalURL != "" {
+		return nil
+	}
+	a.stopDedupProxyLocked()
+	proxy, localURL, err := core.NewDedupProxy(targetURL, thinkingOverride, 2.0)
+	if err != nil {
+		return err
+	}
+	a.dedupProxy = proxy
+	a.dedupLocalURL = localURL
+	return nil
+}
+
+func (a *Agent) stopDedupProxyLocked() {
+	if a.dedupProxy != nil {
+		a.dedupProxy.Close()
+		a.dedupProxy = nil
+		a.dedupLocalURL = ""
 	}
 }
 
