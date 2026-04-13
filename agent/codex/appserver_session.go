@@ -565,11 +565,18 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	case "turn/completed":
 		var notif turnNotification
 		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+			var usageRaw map[string]any
+			inputTokens, outputTokens := 0, 0
+			if err := json.Unmarshal(paramsRaw, &usageRaw); err == nil {
+				inputTokens, outputTokens = parseCodexUsage(usageRaw)
+			}
 			s.flushPendingAsText()
 			s.emit(core.Event{
-				Type:      core.EventResult,
-				SessionID: s.CurrentSessionID(),
-				Done:      true,
+				Type:         core.EventResult,
+				SessionID:    s.CurrentSessionID(),
+				Done:         true,
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
 			})
 		}
 

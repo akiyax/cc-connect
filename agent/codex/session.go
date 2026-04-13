@@ -297,7 +297,14 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 
 	case "turn.completed":
 		cs.flushPendingAsText()
-		evt := core.Event{Type: core.EventResult, SessionID: cs.CurrentSessionID(), Done: true}
+		inputTokens, outputTokens := parseCodexUsage(raw)
+		evt := core.Event{
+			Type:         core.EventResult,
+			SessionID:    cs.CurrentSessionID(),
+			Done:         true,
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+		}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():

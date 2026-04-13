@@ -149,6 +149,34 @@ func TestSend_WithImages_PassesImageArgsAndDefaultPrompt(t *testing.T) {
 	}
 }
 
+func TestHandleEvent_TurnCompletedCarriesUsageTokens(t *testing.T) {
+	cs := &codexSession{
+		events: make(chan core.Event, 1),
+		ctx:    context.Background(),
+	}
+	cs.threadID.Store("thread-usage")
+
+	cs.handleEvent(map[string]any{
+		"type": "turn.completed",
+		"usage": map[string]any{
+			"input_tokens":  float64(321),
+			"output_tokens": float64(123),
+		},
+	})
+
+	select {
+	case evt := <-cs.events:
+		if evt.Type != core.EventResult {
+			t.Fatalf("event type = %q, want %q", evt.Type, core.EventResult)
+		}
+		if evt.InputTokens != 321 || evt.OutputTokens != 123 {
+			t.Fatalf("tokens = %d/%d, want 321/123", evt.InputTokens, evt.OutputTokens)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for event")
+	}
+}
+
 func TestSend_ResumeWithImages_PlacesSessionBeforeImageFlags(t *testing.T) {
 	workDir := t.TempDir()
 	binDir := filepath.Join(workDir, "bin")

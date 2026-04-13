@@ -6149,10 +6149,12 @@ func (e *Engine) DeliverMention(chatID, message, senderName string) bool {
 		// No active interactive state for this chat. Find the platform and
 		// construct a synthetic session key so handleMessage can bootstrap
 		// a new session automatically.
+		// Use {platformName}:{chatID} (without suffix) so the key matches
+		// what makeSessionKey produces when share_session_in_channel=true.
+		// This ensures the user's subsequent replies land in the same session.
 		for _, plat := range e.platforms {
 			if rc, ok := plat.(ReplyContextReconstructor); ok {
-				// Build a minimal session key: {platformName}:{chatID}:mention
-				syntheticKey := plat.Name() + ":" + chatID + ":mention"
+				syntheticKey := plat.Name() + ":" + chatID
 				var err error
 				replyCtx, err = rc.ReconstructReplyCtx(syntheticKey)
 				if err != nil {
