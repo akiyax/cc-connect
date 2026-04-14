@@ -307,9 +307,26 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	noSystemPrompt := a.disableSystemPrompt
 	// Newer Claude Code versions require --verbose with --output-format stream-json.
 	disableVerbose := false
+	// If dedup proxy is active, write a temporary settings.local.json so
+	// Claude Code uses the proxy URL (its global settings.json env overrides
+	// process env vars). The file is removed shortly after the process starts.
+	dedupSettingsPath := ""
+	if a.dedupLocalURL != "" {
+		dedupSettingsPath = writeSettingsOverride(a.workDir, a.dedupLocalURL)
+	}
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok, noSystemPrompt)
+	session, err := newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok, noSystemPrompt)
+	if dedupSettingsPath != "" {
+		// Claude Code reads settings synchronously on startup.
+		// Remove the override file after a short delay so it does not affect
+		// the user's manual `claude` usage from the same directory.
+		go func() {
+			time.Sleep(3 * time.Second)
+			removeSettingsOverride(dedupSettingsPath)
+		}()
+	}
+	return session, err
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
@@ -786,10 +803,6 @@ func (a *Agent) ensureDedupProxyLocked(targetURL, thinkingOverride string) error
 	}
 	a.dedupProxy = proxy
 	a.dedupLocalURL = localURL
-        // Claude Code's ~/.claude/settings.json env overrides process env vars.
-        // Write a project-level .claude/settings.local.json with the proxy URL
-        // so it takes highest priority.
-        a.writeDedupSettingsOverride(localURL)
         return nil
 }
 
@@ -798,22 +811,20 @@ func (a *Agent) stopDedupProxyLocked() {
                 a.dedupProxy.Close()
                 a.dedupProxy = nil
                 a.dedupLocalURL = ""
-                a.removeDedupSettingsOverride()
         }
 }
 
-// writeDedupSettingsOverride writes a .claude/settings.local.json in the
-// workspace directory with ANTHROPIC_BASE_URL pointing to the local proxy.
-// Claude Code merges settings.local.json on top of settings.json, so this
-// ensures the proxy URL wins even if settings.json has a different base URL.
-func (a *Agent) writeDedupSettingsOverride(localURL string) {
-        dir := filepath.Join(a.workDir, ".claude")
+// writeSettingsOverride writes a temporary .claude/settings.local.json so
+// that ANTHROPIC_BASE_URL points to our dedup proxy. Claude Code's global
+// ~/.claude/settings.json env section overrides process env vars, so this
+// project-level file is needed to win the override.
+func writeSettingsOverride(workDir, localURL string) string {
+        dir := filepath.Join(workDir, ".claude")
         if err := os.MkdirAll(dir, 0755); err != nil {
                 slog.Warn("dedupproxy: cannot create .claude dir", "error", err)
-                return
+                return ""
         }
         path := filepath.Join(dir, "settings.local.json")
-        // Read existing file to preserve other settings.
         var settings map[string]any
         if data, err := os.ReadFile(path); err == nil {
                 json.Unmarshal(data, &settings)
@@ -830,15 +841,18 @@ func (a *Agent) writeDedupSettingsOverride(localURL string) {
         data, _ := json.MarshalIndent(settings, "", "  ")
         if err := os.WriteFile(path, data, 0644); err != nil {
                 slog.Warn("dedupproxy: cannot write settings.local.json", "error", err)
-        } else {
-                slog.Info("dedupproxy: wrote settings.local.json", "path", path, "base_url", localURL)
+                return ""
         }
+        slog.Info("dedupproxy: wrote settings.local.json", "path", path, "base_url", localURL)
+        return path
 }
 
-// removeDedupSettingsOverride removes the ANTHROPIC_BASE_URL override from
-// the project's .claude/settings.local.json when the proxy stops.
-func (a *Agent) removeDedupSettingsOverride() {
-        path := filepath.Join(a.workDir, ".claude", "settings.local.json")
+// removeSettingsOverride removes the ANTHROPIC_BASE_URL key (or the whole
+// file if it would be empty) after Claude Code has started and read it.
+func removeSettingsOverride(path string) {
+        if path == "" {
+                return
+        }
         data, err := os.ReadFile(path)
         if err != nil {
                 return
