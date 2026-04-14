@@ -307,26 +307,9 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	noSystemPrompt := a.disableSystemPrompt
 	// Newer Claude Code versions require --verbose with --output-format stream-json.
 	disableVerbose := false
-	// If dedup proxy is active, write a temporary settings.local.json so
-	// Claude Code uses the proxy URL (its global settings.json env overrides
-	// process env vars). The file is removed shortly after the process starts.
-	dedupSettingsPath := ""
-	if a.dedupLocalURL != "" {
-		dedupSettingsPath = writeSettingsOverride(a.workDir, a.dedupLocalURL)
-	}
 	a.mu.Unlock()
 
-	session, err := newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok, noSystemPrompt)
-	if dedupSettingsPath != "" {
-		// Claude Code reads settings synchronously on startup.
-		// Remove the override file after a short delay so it does not affect
-		// the user's manual `claude` usage from the same directory.
-		go func() {
-			time.Sleep(3 * time.Second)
-			removeSettingsOverride(dedupSettingsPath)
-		}()
-	}
-	return session, err
+	return newClaudeSession(ctx, a.workDir, model, sessionID, a.mode, tools, disTools, extraEnv, platformPrompt, disableVerbose, maxTok, noSystemPrompt)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
@@ -811,69 +794,6 @@ func (a *Agent) stopDedupProxyLocked() {
                 a.dedupProxy.Close()
                 a.dedupProxy = nil
                 a.dedupLocalURL = ""
-        }
-}
-
-// writeSettingsOverride writes a temporary .claude/settings.local.json so
-// that ANTHROPIC_BASE_URL points to our dedup proxy. Claude Code's global
-// ~/.claude/settings.json env section overrides process env vars, so this
-// project-level file is needed to win the override.
-func writeSettingsOverride(workDir, localURL string) string {
-        dir := filepath.Join(workDir, ".claude")
-        if err := os.MkdirAll(dir, 0755); err != nil {
-                slog.Warn("dedupproxy: cannot create .claude dir", "error", err)
-                return ""
-        }
-        path := filepath.Join(dir, "settings.local.json")
-        var settings map[string]any
-        if data, err := os.ReadFile(path); err == nil {
-                json.Unmarshal(data, &settings)
-        }
-        if settings == nil {
-                settings = make(map[string]any)
-        }
-        envMap, _ := settings["env"].(map[string]any)
-        if envMap == nil {
-                envMap = make(map[string]any)
-        }
-        envMap["ANTHROPIC_BASE_URL"] = localURL
-        settings["env"] = envMap
-        data, _ := json.MarshalIndent(settings, "", "  ")
-        if err := os.WriteFile(path, data, 0644); err != nil {
-                slog.Warn("dedupproxy: cannot write settings.local.json", "error", err)
-                return ""
-        }
-        slog.Info("dedupproxy: wrote settings.local.json", "path", path, "base_url", localURL)
-        return path
-}
-
-// removeSettingsOverride removes the ANTHROPIC_BASE_URL key (or the whole
-// file if it would be empty) after Claude Code has started and read it.
-func removeSettingsOverride(path string) {
-        if path == "" {
-                return
-        }
-        data, err := os.ReadFile(path)
-        if err != nil {
-                return
-        }
-        var settings map[string]any
-        if json.Unmarshal(data, &settings) != nil {
-                return
-        }
-        if envMap, ok := settings["env"].(map[string]any); ok {
-                delete(envMap, "ANTHROPIC_BASE_URL")
-                if len(envMap) == 0 {
-                        delete(settings, "env")
-                }
-        }
-        if len(settings) == 0 {
-                os.Remove(path)
-                slog.Info("dedupproxy: removed settings.local.json", "path", path)
-        } else {
-                data, _ = json.MarshalIndent(settings, "", "  ")
-                os.WriteFile(path, data, 0644)
-                slog.Info("dedupproxy: cleaned ANTHROPIC_BASE_URL from settings.local.json", "path", path)
         }
 }
 
