@@ -786,15 +786,81 @@ func (a *Agent) ensureDedupProxyLocked(targetURL, thinkingOverride string) error
 	}
 	a.dedupProxy = proxy
 	a.dedupLocalURL = localURL
-	return nil
+        // Claude Code's ~/.claude/settings.json env overrides process env vars.
+        // Write a project-level .claude/settings.local.json with the proxy URL
+        // so it takes highest priority.
+        a.writeDedupSettingsOverride(localURL)
+        return nil
 }
 
 func (a *Agent) stopDedupProxyLocked() {
-	if a.dedupProxy != nil {
-		a.dedupProxy.Close()
-		a.dedupProxy = nil
-		a.dedupLocalURL = ""
-	}
+        if a.dedupProxy != nil {
+                a.dedupProxy.Close()
+                a.dedupProxy = nil
+                a.dedupLocalURL = ""
+                a.removeDedupSettingsOverride()
+        }
+}
+
+// writeDedupSettingsOverride writes a .claude/settings.local.json in the
+// workspace directory with ANTHROPIC_BASE_URL pointing to the local proxy.
+// Claude Code merges settings.local.json on top of settings.json, so this
+// ensures the proxy URL wins even if settings.json has a different base URL.
+func (a *Agent) writeDedupSettingsOverride(localURL string) {
+        dir := filepath.Join(a.workDir, ".claude")
+        if err := os.MkdirAll(dir, 0755); err != nil {
+                slog.Warn("dedupproxy: cannot create .claude dir", "error", err)
+                return
+        }
+        path := filepath.Join(dir, "settings.local.json")
+        // Read existing file to preserve other settings.
+        var settings map[string]any
+        if data, err := os.ReadFile(path); err == nil {
+                json.Unmarshal(data, &settings)
+        }
+        if settings == nil {
+                settings = make(map[string]any)
+        }
+        envMap, _ := settings["env"].(map[string]any)
+        if envMap == nil {
+                envMap = make(map[string]any)
+        }
+        envMap["ANTHROPIC_BASE_URL"] = localURL
+        settings["env"] = envMap
+        data, _ := json.MarshalIndent(settings, "", "  ")
+        if err := os.WriteFile(path, data, 0644); err != nil {
+                slog.Warn("dedupproxy: cannot write settings.local.json", "error", err)
+        } else {
+                slog.Info("dedupproxy: wrote settings.local.json", "path", path, "base_url", localURL)
+        }
+}
+
+// removeDedupSettingsOverride removes the ANTHROPIC_BASE_URL override from
+// the project's .claude/settings.local.json when the proxy stops.
+func (a *Agent) removeDedupSettingsOverride() {
+        path := filepath.Join(a.workDir, ".claude", "settings.local.json")
+        data, err := os.ReadFile(path)
+        if err != nil {
+                return
+        }
+        var settings map[string]any
+        if json.Unmarshal(data, &settings) != nil {
+                return
+        }
+        if envMap, ok := settings["env"].(map[string]any); ok {
+                delete(envMap, "ANTHROPIC_BASE_URL")
+                if len(envMap) == 0 {
+                        delete(settings, "env")
+                }
+        }
+        if len(settings) == 0 {
+                os.Remove(path)
+                slog.Info("dedupproxy: removed settings.local.json", "path", path)
+        } else {
+                data, _ = json.MarshalIndent(settings, "", "  ")
+                os.WriteFile(path, data, 0644)
+                slog.Info("dedupproxy: cleaned ANTHROPIC_BASE_URL from settings.local.json", "path", path)
+        }
 }
 
 // summarizeInput produces a short human-readable description of tool input.
