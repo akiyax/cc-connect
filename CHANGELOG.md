@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+- **DedupProxy: GLM system prompt compatibility**: GLM's Anthropic-compatible endpoint (`open.bigmodel.cn/api/anthropic`) returns HTTP 200 with `event: error` SSE body (code 1302 "rate limit") when the `system` field uses Anthropic's list-of-blocks format (`[{type:"text", text:"...", cache_control:{...}}]`). The proxy now sanitizes request bodies before forwarding: converts `system` from list to plain string, and strips `cache_control` from message content blocks.
+- **DedupProxy: GLM fake-200 rate limit detection**: GLM sometimes returns HTTP 200 with an SSE error body instead of a proper 429 status code. The proxy now detects this pattern (`event: error` + code `1302`) and retries with exponential backoff, same as real 429 responses.
+- **DedupProxy: TCP reset for hedged duplicates**: Claude Code SDK-CLI mode sends two concurrent hedged API requests per turn. Duplicate requests arriving during cooldown are now killed via TCP hijack + close (connection reset), causing Claude Code to use the first request's response — matching interactive mode behavior.
+
 ## v1.2.2-beta.5 (2026-03-31)
 
 Beta release with embedded web admin, Discord proxy support, multimodal fixes, and major platform improvements.

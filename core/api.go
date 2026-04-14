@@ -64,6 +64,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 		engines:    make(map[string]*Engine),
 	}
 	s.mux.HandleFunc("/send", s.handleSend)
+	s.mux.HandleFunc("/test", s.handleTest)
 	s.mux.HandleFunc("/sessions", s.handleSessions)
 	s.mux.HandleFunc("/cron/add", s.handleCronAdd)
 	s.mux.HandleFunc("/cron/list", s.handleCronList)
@@ -210,6 +211,74 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleTest injects a test message into the engine via the normal handleMessage
+// pipeline. This triggers the full flow: engine → agent session → dedup proxy → upstream.
+// The reply goes to the real platform (Feishu etc.) so it's visible in the chat.
+//
+// Usage: curl --unix-socket /path/to/api.sock http://localhost/test \
+//   -d '{"project":"zhanghuo","session_key":"feishu:oc_xxx","message":"say hi"}'
+func (s *APIServer) handleTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Project    string `json:"project"`
+		SessionKey string `json:"session_key"`
+		Message    string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Message == "" {
+		http.Error(w, "message is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	engine, ok := s.engines[req.Project]
+	if !ok && len(s.engines) == 1 {
+		for _, e := range s.engines {
+			engine = e
+			ok = true
+		}
+	}
+	s.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, fmt.Sprintf("project %q not found", req.Project), http.StatusNotFound)
+		return
+	}
+
+	// If no session key specified, use the first active session.
+	sessionKey := req.SessionKey
+	if sessionKey == "" {
+		engine.interactiveMu.Lock()
+		for key := range engine.interactiveStates {
+			sessionKey = key
+			break
+		}
+		engine.interactiveMu.Unlock()
+	}
+	if sessionKey == "" {
+		http.Error(w, "no active session found", http.StatusNotFound)
+		return
+	}
+
+	if err := engine.InjectTestMessage(sessionKey, req.Message); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	apiJSON(w, http.StatusOK, map[string]string{
+		"status":      "ok",
+		"session_key": sessionKey,
+		"message":     "test message injected — check chat for reply",
+	})
 }
 
 func (s *APIServer) handleSessions(w http.ResponseWriter, r *http.Request) {

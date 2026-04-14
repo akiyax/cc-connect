@@ -558,6 +558,46 @@ func (e *Engine) SetCommandSaveDelFunc(fn func(name string) error) {
 	e.commandSaveDelFunc = fn
 }
 
+// InjectTestMessage simulates a user message arriving from a platform.
+// It finds the first platform that can reconstruct a reply context for the
+// given session key, then dispatches the message through the normal
+// handleMessage pipeline. This is for end-to-end testing without a real
+// platform event.
+func (e *Engine) InjectTestMessage(sessionKey, content string) error {
+	var p Platform
+	var replyCtx any
+
+	for _, candidate := range e.platforms {
+		rc, ok := candidate.(ReplyContextReconstructor)
+		if !ok {
+			continue
+		}
+		rctx, err := rc.ReconstructReplyCtx(sessionKey)
+		if err == nil {
+			p = candidate
+			replyCtx = rctx
+			break
+		}
+	}
+
+	if p == nil {
+		return fmt.Errorf("no platform can handle session key %q", sessionKey)
+	}
+
+	msg := &Message{
+		SessionKey: sessionKey,
+		Platform:   p.Name(),
+		MessageID:  fmt.Sprintf("test_%d", time.Now().UnixMilli()),
+		UserID:     "test_user",
+		UserName:   "test_user",
+		Content:    content,
+		ReplyCtx:   replyCtx,
+	}
+
+	e.handleMessage(p, msg)
+	return nil
+}
+
 func (e *Engine) SetDisplaySaveFunc(fn func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error) {
 	e.displaySaveFunc = fn
 }

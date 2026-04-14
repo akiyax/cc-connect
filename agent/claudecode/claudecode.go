@@ -780,7 +780,9 @@ func (a *Agent) ensureDedupProxyLocked(targetURL, thinkingOverride string) error
 		return nil
 	}
 	a.stopDedupProxyLocked()
-	proxy, localURL, err := core.NewDedupProxy(targetURL, thinkingOverride)
+	// cooldown=5s: blocks the second same-turn request that arrives slightly
+	// after the first completes (~0.1s). User response time is typically >5s.
+	proxy, localURL, err := core.NewDedupProxy(targetURL, thinkingOverride, 5.0)
 	if err != nil {
 		return err
 	}
