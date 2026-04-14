@@ -1,8 +1,8 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,20 +12,18 @@ import (
 )
 
 func TestDedupProxy_AllowsSingleRequest(t *testing.T) {
-	// Upstream server that returns a valid response
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"id":      "msg_test",
-			"type":    "message",
+			"id": "msg_test", "type": "message",
 			"content": []any{map[string]any{"type": "text", "text": "hello"}},
 		})
 	}))
 	defer upstream.Close()
 
-	dp, localURL, err := NewDedupProxy(upstream.URL, "", 0)
+	dp, localURL, err := NewDedupProxy(upstream.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,39 +43,33 @@ func TestDedupProxy_AllowsSingleRequest(t *testing.T) {
 	}
 }
 
-func TestDedupProxy_BlocksConcurrentRequest(t *testing.T) {
-	// Upstream server that takes a while to respond
+func TestDedupProxy_QueuesConcurrentRequest(t *testing.T) {
+	// Upstream takes a short while; second request should be queued, not faked.
 	var upstreamCalls atomic.Int32
-	started := make(chan struct{})
+	started := make(chan struct{}, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
-		// Signal that first request started
 		select {
 		case started <- struct{}{}:
 		default:
 		}
-		// Simulate slow response
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":      "msg_test",
-			"type":    "message",
-			"content": []any{},
-		})
+		json.NewEncoder(w).Encode(map[string]any{"id": "msg_test", "type": "message"})
 	}))
 	defer upstream.Close()
 
-	dp, localURL, err := NewDedupProxy(upstream.URL, "", 0)
+	dp, localURL, err := NewDedupProxy(upstream.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dp.Close()
 
 	var wg sync.WaitGroup
+	statuses := make([]int, 2)
 
-	// First request — should go through
+	// First request.
 	wg.Add(1)
-	var resp1Status int
 	go func() {
 		defer wg.Done()
 		resp, err := http.Post(localURL+"/v1/messages", "application/json", nil)
@@ -85,128 +77,86 @@ func TestDedupProxy_BlocksConcurrentRequest(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		resp1Status = resp.StatusCode
+		statuses[0] = resp.StatusCode
 		resp.Body.Close()
 	}()
 
-	// Wait for first request to reach upstream
-	<-started
+	<-started // first request reached upstream
 
-	// Second concurrent request — should be blocked with fake 200
-	resp2, err := http.Post(localURL+"/v1/messages", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp2.Body.Close()
-
-	body, _ := io.ReadAll(resp2.Body)
-	var result map[string]any
-	json.Unmarshal(body, &result)
+	// Second concurrent request — should be queued, get real 200 after first completes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := http.Post(localURL+"/v1/messages", "application/json", nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		statuses[1] = resp.StatusCode
+		resp.Body.Close()
+	}()
 
 	wg.Wait()
 
-	if resp1Status != 200 {
-		t.Errorf("first request: expected 200, got %d", resp1Status)
+	if statuses[0] != 200 {
+		t.Errorf("first request: expected 200, got %d", statuses[0])
 	}
-	if resp2.StatusCode != 200 {
-		t.Errorf("second request: expected fake 200, got %d", resp2.StatusCode)
+	if statuses[1] != 200 {
+		t.Errorf("second request: expected queued 200, got %d", statuses[1])
 	}
-	if result["id"] != "msg_dedup_blocked" {
-		t.Errorf("expected fake response id, got %v", result["id"])
-	}
-	if upstreamCalls.Load() != 1 {
-		t.Errorf("expected 1 upstream call, got %d", upstreamCalls.Load())
-	}
-}
-
-func TestDedupProxy_CooldownBlocksQuickFollow(t *testing.T) {
-	var upstreamCalls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":   "msg_test",
-			"type": "message",
-		})
-	}))
-	defer upstream.Close()
-
-	dp, localURL, err := NewDedupProxy(upstream.URL, "", 1.0) // 1s cooldown
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dp.Close()
-
-	// First request — succeeds
-	resp, err := http.Post(localURL+"/v1/messages", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	// Immediate second request — should be blocked by cooldown
-	resp2, err := http.Post(localURL+"/v1/messages", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-
-	var result map[string]any
-	json.Unmarshal(body2, &result)
-
-	if result["id"] != "msg_dedup_blocked" {
-		t.Errorf("expected cooldown block, got %v", result["id"])
-	}
-	if upstreamCalls.Load() != 1 {
-		t.Errorf("expected 1 upstream call, got %d", upstreamCalls.Load())
-	}
-}
-
-func TestDedupProxy_AllowsAfterCooldown(t *testing.T) {
-	var upstreamCalls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":   "msg_test",
-			"type": "message",
-		})
-	}))
-	defer upstream.Close()
-
-	dp, localURL, err := NewDedupProxy(upstream.URL, "", 0.1) // 100ms cooldown
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dp.Close()
-
-	// First request
-	resp, err := http.Post(localURL+"/v1/messages", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	// Wait for cooldown
-	time.Sleep(150 * time.Millisecond)
-
-	// Second request — should succeed
-	resp2, err := http.Post(localURL+"/v1/messages", "application/json", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-
-	var result map[string]any
-	json.Unmarshal(body2, &result)
-
-	if result["id"] == "msg_dedup_blocked" {
-		t.Error("request should not be blocked after cooldown")
-	}
+	// Both requests went to upstream (sequentially).
 	if upstreamCalls.Load() != 2 {
 		t.Errorf("expected 2 upstream calls, got %d", upstreamCalls.Load())
+	}
+}
+
+func TestDedupProxy_CancelledQueuedRequest(t *testing.T) {
+	// Second client cancels while waiting; upstream should only get 1 call.
+	started := make(chan struct{}, 1)
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"id": "msg_test", "type": "message"})
+	}))
+	defer upstream.Close()
+
+	dp, localURL, err := NewDedupProxy(upstream.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dp.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := http.Post(localURL+"/v1/messages", "application/json", nil)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	<-started // first request in-flight
+
+	// Second request with short timeout — cancels before slot is free.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, localURL+"/v1/messages", nil)
+	_, err = http.DefaultClient.Do(req)
+	if err == nil {
+		t.Error("expected cancellation error for second request")
+	}
+
+	wg.Wait()
+
+	if upstreamCalls.Load() != 1 {
+		t.Errorf("expected 1 upstream call, got %d", upstreamCalls.Load())
 	}
 }
 
@@ -218,13 +168,12 @@ func TestDedupProxy_NonMessagesPassThrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	dp, localURL, err := NewDedupProxy(upstream.URL, "", 0)
+	dp, localURL, err := NewDedupProxy(upstream.URL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dp.Close()
 
-	// Multiple concurrent non-messages requests should all pass through
 	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
 		wg.Add(1)

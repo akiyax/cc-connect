@@ -1,7 +1,7 @@
 package core
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,12 +13,15 @@ import (
 	"time"
 )
 
-// DedupProxy is a local reverse proxy that deduplicates concurrent
-// /messages requests. Claude Code's sdk-cli mode (stdin/stdout piped)
-// sends two concurrent API requests per turn. Providers with strict
-// rate limits (e.g. GLM-5.1 ≈ 1 req/min) reject the second request
-// with 429. This proxy allows only one in-flight /messages request at
-// a time and returns a synthesized empty response for duplicates.
+// DedupProxy is a local reverse proxy that serializes concurrent /messages
+// requests. Claude Code's sdk-cli mode (stdin/stdout piped) sends two
+// concurrent API requests per turn. Providers with strict concurrency limits
+// (e.g. GLM-5.1 ≈ 1 concurrent request) reject the second with 429.
+//
+// Instead of returning a fake response for the duplicate, we queue it and
+// forward it only after the first request completes. Claude Code typically
+// cancels the second request once it has received the first response, so in
+// practice the queued request is never actually forwarded.
 type DedupProxy struct {
 	targetURL string
 	listener  net.Listener
@@ -26,17 +29,15 @@ type DedupProxy struct {
 	once      sync.Once
 
 	mu       sync.Mutex
-	inFlight bool    // is a /messages request currently in-flight?
-	lastDone float64 // unix timestamp of last successful response
-	cooldown float64 // seconds to wait after last response
+	inFlight bool          // is a /messages request currently being proxied?
+	doneCh   chan struct{}  // closed when inFlight transitions to false
 }
 
 // NewDedupProxy creates and starts a local dedup reverse proxy.
 // targetURL is the upstream API base URL. thinkingOverride, if non-empty,
-// additionally rewrites thinking.type "adaptive" (combining both functions).
-// cooldown is the minimum seconds between consecutive /messages requests.
+// additionally rewrites thinking.type in the request body.
 // Returns the proxy and local URL to use as ANTHROPIC_BASE_URL.
-func NewDedupProxy(targetURL, thinkingOverride string, cooldown float64) (*DedupProxy, string, error) {
+func NewDedupProxy(targetURL, thinkingOverride string) (*DedupProxy, string, error) {
 	target, err := url.Parse(strings.TrimRight(targetURL, "/"))
 	if err != nil {
 		return nil, "", fmt.Errorf("dedupproxy: parse target: %w", err)
@@ -58,7 +59,6 @@ func NewDedupProxy(targetURL, thinkingOverride string, cooldown float64) (*Dedup
 	dp := &DedupProxy{
 		targetURL: targetURL,
 		listener:  listener,
-		cooldown:  cooldown,
 	}
 
 	override := thinkingOverride
@@ -67,26 +67,25 @@ func NewDedupProxy(targetURL, thinkingOverride string, cooldown float64) (*Dedup
 		isMessages := r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages")
 
 		if isMessages {
-			if dp.shouldBlock() {
-				dp.writeFakeResponse(w)
+			// Acquire the serialization slot. If another request is already
+			// in-flight, block until it completes or the client cancels.
+			if !dp.acquire(r.Context()) {
+				// Client cancelled (e.g. Claude Code already got a response
+				// from the first request and dropped this connection).
+				slog.Info("dedupproxy: queued /messages request cancelled by client")
 				return
 			}
-			// Optionally rewrite thinking
 			if override != "" {
 				rewriteThinkingInRequest(r, override)
 			}
-			// Wrap ResponseWriter to detect completion.
-			// defer ensures inFlight is always released even on panic/error.
+			// defer ensures the slot is always released even on panic/error.
 			dw := &dedupResponseWriter{ResponseWriter: w, dp: dp}
 			defer dw.finish()
 			proxy.ServeHTTP(dw, r)
 			return
 		}
 
-		// Non-messages requests pass through unchanged
-		if override != "" && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages") {
-			rewriteThinkingInRequest(r, override)
-		}
+		// Non-messages requests pass through unchanged.
 		proxy.ServeHTTP(w, r)
 	})
 
@@ -104,66 +103,45 @@ func NewDedupProxy(targetURL, thinkingOverride string, cooldown float64) (*Dedup
 
 	localURL := fmt.Sprintf("http://127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port)
 	slog.Info("dedupproxy: started", "target", targetURL, "local", localURL,
-		"thinking", thinkingOverride, "cooldown", cooldown)
+		"thinking", thinkingOverride)
 	return dp, localURL, nil
 }
 
-// shouldBlock returns true if the request should be blocked (duplicate).
-// If allowed, marks as in-flight.
-func (dp *DedupProxy) shouldBlock() bool {
-	dp.mu.Lock()
-	defer dp.mu.Unlock()
+// acquire blocks until the serialization slot is free, then claims it.
+// Returns false if ctx is cancelled before the slot becomes available.
+func (dp *DedupProxy) acquire(ctx context.Context) bool {
+	for {
+		dp.mu.Lock()
+		if !dp.inFlight {
+			dp.inFlight = true
+			dp.doneCh = make(chan struct{})
+			dp.mu.Unlock()
+			slog.Info("dedupproxy: acquired slot for /messages request")
+			return true
+		}
+		ch := dp.doneCh
+		dp.mu.Unlock()
 
-	now := float64(time.Now().UnixMilli()) / 1000.0
-
-	if dp.inFlight {
-		slog.Warn("dedupproxy: blocked concurrent /messages request (in-flight)")
-		return true
+		slog.Info("dedupproxy: queuing /messages request (slot busy)")
+		select {
+		case <-ch:
+			// Slot released; retry the acquire loop.
+		case <-ctx.Done():
+			return false
+		}
 	}
-
-	if dp.cooldown > 0 && dp.lastDone > 0 && (now-dp.lastDone) < dp.cooldown {
-		slog.Warn("dedupproxy: blocked /messages request (cooldown)",
-			"elapsed", fmt.Sprintf("%.1fs", now-dp.lastDone),
-			"cooldown", dp.cooldown)
-		return true
-	}
-
-	dp.inFlight = true
-	slog.Info("dedupproxy: allowing /messages request")
-	return false
 }
 
-// markDone marks the in-flight request as completed.
-func (dp *DedupProxy) markDone(status int) {
+// release marks the in-flight request as completed and notifies waiters.
+func (dp *DedupProxy) release(status int) {
 	dp.mu.Lock()
 	defer dp.mu.Unlock()
 	dp.inFlight = false
-	if status >= 200 && status < 300 {
-		dp.lastDone = float64(time.Now().UnixMilli()) / 1000.0
+	if dp.doneCh != nil {
+		close(dp.doneCh)
+		dp.doneCh = nil
 	}
-	slog.Info("dedupproxy: /messages response", "status", status)
-}
-
-// writeFakeResponse writes a minimal valid Anthropic API response.
-func (dp *DedupProxy) writeFakeResponse(w http.ResponseWriter) {
-	resp := map[string]any{
-		"id":            "msg_dedup_blocked",
-		"type":          "message",
-		"role":          "assistant",
-		"model":         "dedup-blocked",
-		"content":       []any{},
-		"stop_reason":   "end_turn",
-		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  0,
-			"output_tokens": 0,
-		},
-	}
-	body, _ := json.Marshal(resp)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(body)
-	slog.Info("dedupproxy: returned fake 200 for blocked request")
+	slog.Info("dedupproxy: released slot after /messages response", "status", status)
 }
 
 // Close shuts down the proxy.
@@ -193,7 +171,7 @@ func (dw *dedupResponseWriter) Flush() {
 	}
 }
 
-// finish is called after ServeHTTP returns (response fully sent to client).
+// finish releases the serialization slot after the response is fully sent.
 func (dw *dedupResponseWriter) finish() {
 	if dw.finished {
 		return
@@ -203,5 +181,5 @@ func (dw *dedupResponseWriter) finish() {
 	if status == 0 {
 		status = 200
 	}
-	dw.dp.markDone(status)
+	dw.dp.release(status)
 }

@@ -32,7 +32,7 @@ func TestDedupProxy_RealGLM(t *testing.T) {
 
 	baseURL := "https://open.bigmodel.cn/api/anthropic"
 
-	dp, localURL, err := core.NewDedupProxy(baseURL, "", 2.0)
+	dp, localURL, err := core.NewDedupProxy(baseURL, "")
 	if err != nil {
 		t.Fatal(err)
 	}
